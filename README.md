@@ -21,7 +21,7 @@ python skill_audit.py path/to/skill.md --json
 ## Example
 
 ```
-skill-audit v1.0.0
+skill-audit v1.1.0
 File: /skills/evil-skill.md
 Lines: 42 | Chars: 1890
 Verdict: RISK FOUND

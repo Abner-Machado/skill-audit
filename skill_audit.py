@@ -5,13 +5,17 @@ Detects risky patterns in skill markdown: eval, exec, dynamic imports,
 subprocess calls, and other agent-unsafe instructions.
 Zero dependencies. Pure Python 3.8+.
 
-Usage: python skill_audit.py <path/to/skill.md>
+Usage: python skill_audit.py <path/to/skill.md> [--json]
+       python skill_audit.py --version
+       python skill_audit.py --help
 """
 
 import sys
 import re
 import json
 from pathlib import Path
+
+VERSION = "1.1.0"
 
 RISK_PATTERNS = {
     "eval_injection": {
@@ -58,6 +62,18 @@ RISK_PATTERNS = {
     }
 }
 
+# Risks that describe the same underlying danger on a single line. When several
+# match the same line we keep the most specific one instead of reporting noise.
+EXEC_FAMILY = ("command_injection", "eval_injection", "subprocess_escape")
+
+SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
+
+USAGE = (
+    "Usage: python skill_audit.py <path/to/skill.md> [--json]\n"
+    "       python skill_audit.py --version\n"
+    "       python skill_audit.py --help"
+)
+
 
 def audit_file(filepath: str) -> dict:
     path = Path(filepath)
@@ -66,28 +82,46 @@ def audit_file(filepath: str) -> dict:
     if not path.is_file():
         return {"error": f"Not a file: {filepath}"}
 
-    content = path.read_text(encoding="utf-8", errors="replace")
+    try:
+        content = path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return {"error": f"Cannot read {filepath}: {exc}"}
+
     lines = content.split("\n")
-    findings = []
     stats = {"total_lines": len(lines), "total_chars": len(content)}
 
+    # per_line[line_no][risk_id] = snippet ; keeps one entry per risk per line
+    per_line = {}
     for risk_id, risk in RISK_PATTERNS.items():
         for pattern in risk["patterns"]:
             for i, line in enumerate(lines, 1):
                 if re.search(pattern, line, re.IGNORECASE):
-                    findings.append({
-                        "risk_id": risk_id,
-                        "severity": risk["severity"],
-                        "message": risk["message"],
-                        "line": i,
-                        "snippet": line.strip()[:120],
-                        "remediation": risk["remediation"]
-                    })
+                    per_line.setdefault(i, {})[risk_id] = line.strip()[:120]
 
-    findings.sort(key=lambda f: (
-        {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}[f["severity"]],
-        f["line"]
-    ))
+    findings = []
+    for line_no in sorted(per_line):
+        hits = per_line[line_no]
+        exec_hits = [r for r in EXEC_FAMILY if r in hits]
+        if len(exec_hits) > 1:
+            keep = exec_hits[0]
+            others = [r for r in exec_hits[1:]]
+            hits = {r: v for r, v in hits.items() if r not in others}
+            suffix = ", ".join(RISK_PATTERNS[r]["message"].split(" in ")[0].lower()
+                               for r in others)
+            hits[keep] = hits[keep] + f" [also: {suffix}]"
+
+        for risk_id, snippet in hits.items():
+            risk = RISK_PATTERNS[risk_id]
+            findings.append({
+                "risk_id": risk_id,
+                "severity": risk["severity"],
+                "message": risk["message"],
+                "line": line_no,
+                "snippet": snippet[:120],
+                "remediation": risk["remediation"]
+            })
+
+    findings.sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["line"]))
 
     summary = {
         "CRITICAL": sum(1 for f in findings if f["severity"] == "CRITICAL"),
@@ -108,24 +142,52 @@ def audit_file(filepath: str) -> dict:
     }
 
 
+def parse_args(argv):
+    files = []
+    as_json = False
+    for arg in argv:
+        if arg == "--json":
+            as_json = True
+        elif arg in ("--version", "--help", "-h"):
+            continue
+        elif arg.startswith("-"):
+            raise ValueError(f"unknown option: {arg}")
+        else:
+            files.append(arg)
+    return files, as_json
+
+
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python skill_audit.py <path/to/skill.md> [--json]")
-        sys.exit(1)
+    argv = sys.argv[1:]
 
-    as_json = "--json" in sys.argv
-    filepath = sys.argv[1]
+    if "--version" in argv:
+        print(f"skill-audit v{VERSION}")
+        return 0
+    if "--help" in argv or "-h" in argv:
+        print(USAGE)
+        return 0
 
-    result = audit_file(filepath)
+    try:
+        files, as_json = parse_args(argv)
+    except ValueError as exc:
+        print(f"skill-audit: error: {exc}", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    if len(files) != 1:
+        print(USAGE, file=sys.stderr)
+        return 2
+
+    result = audit_file(files[0])
 
     if "error" in result:
         print(result["error"], file=sys.stderr)
-        sys.exit(2)
+        return 2
 
     if as_json:
         print(json.dumps(result, indent=2))
     else:
-        print(f"skill-audit v1.0.0")
+        print(f"skill-audit v{VERSION}")
         print(f"File: {result['file']}")
         print(f"Lines: {result['stats']['total_lines']} | Chars: {result['stats']['total_chars']}")
         print(f"Verdict: {result['verdict']}")
@@ -138,8 +200,8 @@ def main():
         else:
             print("No risks detected.")
 
-    sys.exit(0 if result.get("passed", False) else 1)
+    return 0 if result.get("passed", False) else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
